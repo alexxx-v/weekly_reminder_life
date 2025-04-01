@@ -1,0 +1,15 @@
+# Виртуальное окружение
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# База данных (будет храниться в томе)
+bot_users.db
+data/
+
+# Другие файлы
+.DS_Store
+.env
+.git
+.gitignore

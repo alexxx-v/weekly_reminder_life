@@ -1,0 +1,21 @@
+# Виртуальное окружение
+venv/
+
+# Файлы окружения
+.env
+
+# База данных SQLite
+*.db
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Дистрибутивы
+dist/
+build/
+*.egg-info/
+
+# Логи
+*.log
