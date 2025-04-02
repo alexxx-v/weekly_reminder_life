@@ -15,6 +15,8 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
+from dateutil.relativedelta import relativedelta
+from dateutil.relativedelta import relativedelta
 
 # Загружаем переменные окружения из файла .env
 load_dotenv()
@@ -35,67 +37,92 @@ DB_NAME = os.environ.get('DB_NAME', 'weekly_reminder')
 DB_USER = os.environ.get('DB_USER', 'postgres')
 DB_PASSWORD = os.environ.get('DB_PASSWORD', 'postgres')
 
+class DatabaseConnection:
+    """Контекстный менеджер для работы с базой данных PostgreSQL"""
+    def __init__(self):
+        self.conn = None
+        
+    def __enter__(self):
+        try:
+            self.conn = psycopg2.connect(
+                host=DB_HOST,
+                port=DB_PORT,
+                dbname=DB_NAME,
+                user=DB_USER,
+                password=DB_PASSWORD
+            )
+            return self.conn
+        except psycopg2.Error as e:
+            logger.error(f"Ошибка при подключении к базе данных: {e}")
+            raise
+            
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            self.conn.close()
+            
 def get_db_connection():
-    """Создает и возвращает соединение с базой данных PostgreSQL"""
-    try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD
-        )
-        return conn
-    except psycopg2.Error as e:
-        logger.error(f"Ошибка при подключении к базе данных: {e}")
-        raise
+    """Создает и возвращает соединение с базой данных PostgreSQL как контекстный менеджер"""
+    return DatabaseConnection()
 
 def init_db():
     try:
-        conn = get_db_connection()
-        conn.autocommit = True
-        cursor = conn.cursor()
-        
-        # Проверяем, существует ли таблица users
-        cursor.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'users'
-            );
-        """)
-        result = cursor.fetchone()
-        table_exists = result[0] if result is not None else False
-        
-        if not table_exists:
-            # Создаем таблицу users
-            cursor.execute("""
-                CREATE TABLE users (
-                    user_id BIGINT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    birthdate DATE NOT NULL,
-                    life_expectancy INTEGER DEFAULT 90
-                )
-            """)
-            logger.info("Таблица users создана успешно")
-        else:
-            # Проверяем, существует ли колонка life_expectancy
-            cursor.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.columns 
-                    WHERE table_name = 'users' AND column_name = 'life_expectancy'
-                );
-            """)
-            result = cursor.fetchone()
-            column_exists = result[0] if result is not None else False
+        with get_db_connection() as conn:
+            conn.autocommit = True
+            with conn.cursor() as cursor:
+                # Проверяем, существует ли таблица users
+                cursor.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'users'
+                    );
+                """)
+                result = cursor.fetchone()
+                table_exists = result[0] if result is not None else False
+                
+                if not table_exists:
+                    # Создаем таблицу users
+                    cursor.execute("""
+                        CREATE TABLE users (
+                            user_id BIGINT PRIMARY KEY,
+                            name TEXT NOT NULL,
+                            birthdate DATE NOT NULL,
+                            life_expectancy INTEGER DEFAULT 90,
+                            notifications_enabled BOOLEAN DEFAULT TRUE
+                        )
+                    """)
+                    logger.info("Таблица users создана успешно")
+                else:
+                    # Проверяем, существует ли колонка life_expectancy
+                    cursor.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.columns 
+                            WHERE table_name = 'users' AND column_name = 'life_expectancy'
+                        );
+                    """)
+                    result = cursor.fetchone()
+                    column_exists = result[0] if result is not None else False
+                    
+                    if not column_exists:
+                        # Добавляем колонку life_expectancy, если она не существует
+                        cursor.execute("ALTER TABLE users ADD COLUMN life_expectancy INTEGER DEFAULT 90")
+                        logger.info("Колонка life_expectancy добавлена в таблицу users")
+                    
+                    # Проверяем, существует ли колонка notifications_enabled
+                    cursor.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.columns 
+                            WHERE table_name = 'users' AND column_name = 'notifications_enabled'
+                        );
+                    """)
+                    result = cursor.fetchone()
+                    column_exists = result[0] if result is not None else False
+                    
+                    if not column_exists:
+                        # Добавляем колонку notifications_enabled, если она не существует
+                        cursor.execute("ALTER TABLE users ADD COLUMN notifications_enabled BOOLEAN DEFAULT TRUE")
+                        logger.info("Колонка notifications_enabled добавлена в таблицу users")
             
-            if not column_exists:
-                # Добавляем колонку life_expectancy, если она не существует
-                cursor.execute("ALTER TABLE users ADD COLUMN life_expectancy INTEGER DEFAULT 90")
-                logger.info("Колонка life_expectancy добавлена в таблицу users")
-        
-        cursor.close()
-        conn.close()
-        logger.info(f"База данных PostgreSQL инициализирована успешно")
+            logger.info(f"База данных PostgreSQL инициализирована успешно")
     except psycopg2.Error as e:
         logger.error(f"Ошибка при инициализации базы данных: {e}")
         raise
@@ -171,29 +198,26 @@ async def get_birthdate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             
         user_id = update.message.from_user.id
         try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            # Проверяем, существует ли пользователь
-            cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
-            user_exists = cursor.fetchone() is not None
-            
-            if user_exists:
-                # Обновляем существующего пользователя
-                cursor.execute(
-                    "UPDATE users SET name = %s, birthdate = %s, life_expectancy = %s WHERE user_id = %s",
-                    (context.user_data['name'], birthdate, 90, user_id)
-                )
-            else:
-                # Добавляем нового пользователя
-                cursor.execute(
-                    "INSERT INTO users (user_id, name, birthdate, life_expectancy) VALUES (%s, %s, %s, %s)",
-                    (user_id, context.user_data['name'], birthdate, 90)
-                )
-            
-            conn.commit()
-            cursor.close()
-            conn.close()
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Проверяем, существует ли пользователь
+                    cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+                    user_exists = cursor.fetchone() is not None
+                    
+                    if user_exists:
+                        # Обновляем существующего пользователя
+                        cursor.execute(
+                            "UPDATE users SET name = %s, birthdate = %s, life_expectancy = %s WHERE user_id = %s",
+                            (context.user_data['name'], birthdate, 90, user_id)
+                        )
+                    else:
+                        # Добавляем нового пользователя
+                        cursor.execute(
+                            "INSERT INTO users (user_id, name, birthdate, life_expectancy, notifications_enabled) VALUES (%s, %s, %s, %s, %s)",
+                            (user_id, context.user_data['name'], birthdate, 90, True)
+                        )
+                
+                conn.commit()
             
             await update.message.reply_text(
                 "✅ Данные сохранены! Каждое воскресенье в 21:00 ты будешь получать обновление.",
@@ -218,16 +242,13 @@ async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     today = date.today()
     
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            "SELECT name, birthdate, life_expectancy FROM users WHERE user_id = %s", 
-            (user_id,)
-        )
-        user_data = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT name, birthdate, life_expectancy FROM users WHERE user_id = %s", 
+                    (user_id,)
+                )
+                user_data = cursor.fetchone()
         
         if not user_data:
             await update.message.reply_text(
@@ -239,17 +260,24 @@ async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         name, birthdate, life_expectancy = user_data
         # birthdate уже является объектом date в PostgreSQL
         
-        # Расчет статистики
+        # Расчет статистики с использованием dateutil для точных расчетов
+        delta = relativedelta(today, birthdate)
         days = (today - birthdate).days
         weeks = days // 7
-        months = days // 30  # Приблизительно
-        years = days // 365  # Приблизительно
         
-        # Расчет оставшегося времени
-        remaining_years = life_expectancy - years
-        remaining_days = remaining_years * 365  # Приблизительно
-        remaining_weeks = remaining_days // 7  # Приблизительно
-        remaining_months = remaining_years * 12  # Приблизительно
+        # Точные расчеты месяцев и лет
+        years = delta.years
+        months = delta.years * 12 + delta.months
+        
+        # Расчет оставшегося времени с учетом високосных лет
+        remaining_delta = relativedelta(years=life_expectancy) - delta
+        remaining_years = remaining_delta.years
+        remaining_months = remaining_delta.years * 12 + remaining_delta.months
+        
+        # Приблизительный расчет оставшихся дней и недель
+        # Учитываем високосные годы (примерно 365.25 дней в году)
+        remaining_days = int(remaining_years * 365.25)
+        remaining_weeks = remaining_days // 7
         
         await update.message.reply_text(
             f"📊 Статистика для {name}:\n\n"
@@ -280,16 +308,13 @@ async def edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     user_id = update.message.from_user.id
     
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            "SELECT name, birthdate, life_expectancy FROM users WHERE user_id = %s", 
-            (user_id,)
-        )
-        user_data = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT name, birthdate, life_expectancy, notifications_enabled FROM users WHERE user_id = %s", 
+                    (user_id,)
+                )
+                user_data = cursor.fetchone()
         
         if not user_data:
             await update.message.reply_text(
@@ -298,12 +323,16 @@ async def edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             )
             return MAIN_MENU
             
-        name, birthdate, life_expectancy = user_data
+        name, birthdate, life_expectancy, notifications_enabled = user_data
         # birthdate уже является объектом date в PostgreSQL
+        
+        notifications_status = "Включены ✅" if notifications_enabled else "Отключены ❌"
         
         keyboard = [
             [KeyboardButton("✏️ Изменить имя"), KeyboardButton("📅 Изменить дату рождения")],
             [KeyboardButton("⏳ Изменить продолжительность жизни")],
+            [KeyboardButton("🔔 Управление уведомлениями")],
+            [KeyboardButton("❌ Удалить профиль")],
             [KeyboardButton("🔙 Назад в меню")]
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -312,7 +341,8 @@ async def edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             f"Текущие данные:\n"
             f"👤 Имя: {name}\n"
             f"📅 Дата рождения: {birthdate.strftime('%d.%m.%Y')}\n"
-            f"⏳ Продолжительность жизни: {life_expectancy} лет\n\n"
+            f"⏳ Продолжительность жизни: {life_expectancy} лет\n"
+            f"🔔 Уведомления: {notifications_status}\n\n"
             f"Что хочешь изменить?",
             reply_markup=reply_markup
         )
@@ -325,6 +355,9 @@ async def edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             reply_markup=get_main_menu_keyboard()
         )
         return MAIN_MENU
+
+# Константы для новых состояний ConversationHandler
+MANAGE_NOTIFICATIONS, DELETE_PROFILE, CUSTOM_LIFE_EXPECTANCY = range(7, 10)
 
 async def edit_profile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обрабатывает выбор в меню редактирования профиля"""
@@ -339,6 +372,7 @@ async def edit_profile_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     elif text == "⏳ Изменить продолжительность жизни":
         keyboard = [
             [KeyboardButton("70 лет"), KeyboardButton("80 лет"), KeyboardButton("90 лет")],
+            [KeyboardButton("Другое значение")],
             [KeyboardButton("🔙 Назад")]
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -347,6 +381,48 @@ async def edit_profile_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=reply_markup
         )
         return EDIT_LIFE_EXPECTANCY
+    elif text == "🔔 Управление уведомлениями":
+        user_id = update.message.from_user.id
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT notifications_enabled FROM users WHERE user_id = %s", 
+                        (user_id,)
+                    )
+                    result = cursor.fetchone()
+                    notifications_enabled = result[0] if result else True
+                    
+                    # Создаем клавиатуру с противоположным действием
+                    keyboard = [[
+                        KeyboardButton("Отключить уведомления" if notifications_enabled else "Включить уведомления")
+                    ], [KeyboardButton("🔙 Назад")]]
+                    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+                    
+                    status = "включены" if notifications_enabled else "отключены"
+                    await update.message.reply_text(
+                        f"Сейчас уведомления {status}. Что ты хочешь сделать?",
+                        reply_markup=reply_markup
+                    )
+                    return MANAGE_NOTIFICATIONS
+        except psycopg2.Error as e:
+            logger.error(f"Ошибка при получении статуса уведомлений пользователя {user_id}: {e}")
+            await update.message.reply_text(
+                "❌ Произошла ошибка при получении данных. Пожалуйста, попробуйте позже.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+    elif text == "❌ Удалить профиль":
+        keyboard = [
+            [KeyboardButton("✅ Да, удалить профиль")],
+            [KeyboardButton("❌ Нет, отменить")]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text(
+            "⚠️ Ты уверен, что хочешь удалить свой профиль? Все данные будут безвозвратно удалены.",
+            reply_markup=reply_markup
+        )
+        return DELETE_PROFILE
     elif text == "🔙 Назад в меню":
         await update.message.reply_text(
             "Возвращаемся в главное меню.",
@@ -365,17 +441,13 @@ async def edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
     
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            "UPDATE users SET name = %s WHERE user_id = %s",
-            (new_name, user_id)
-        )
-        
-        conn.commit()
-        cursor.close()
-        conn.close()
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE users SET name = %s WHERE user_id = %s",
+                    (new_name, user_id)
+                )
+            conn.commit()
         
         await update.message.reply_text(
             f"✅ Имя успешно изменено на '{new_name}'!",
@@ -401,17 +473,13 @@ async def edit_birthdate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
         user_id = update.message.from_user.id
         try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute(
-                "UPDATE users SET birthdate = %s WHERE user_id = %s",
-                (new_birthdate, user_id)
-            )
-            
-            conn.commit()
-            cursor.close()
-            conn.close()
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE users SET birthdate = %s WHERE user_id = %s",
+                        (new_birthdate, user_id)
+                    )
+                conn.commit()
             
             await update.message.reply_text(
                 f"✅ Дата рождения успешно изменена на {new_birthdate.strftime('%d.%m.%Y')}!",
@@ -438,36 +506,40 @@ async def edit_life_expectancy(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == "🔙 Назад":
         return await edit_profile(update, context)
     
+    if text == "Другое значение":
+        await update.message.reply_text(
+            "Введи желаемую продолжительность жизни (целое число от 50 до 120):",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return CUSTOM_LIFE_EXPECTANCY
+    
     try:
         # Извлекаем число из текста (70, 80 или 90)
         new_life_expectancy = int(text.split()[0])
         
-        # Проверяем, что значение кратно 10 и находится в допустимом диапазоне
+        # Проверяем, что значение находится в допустимом диапазоне
         if new_life_expectancy not in [70, 80, 90]:
             keyboard = [
                 [KeyboardButton("70 лет"), KeyboardButton("80 лет"), KeyboardButton("90 лет")],
+                [KeyboardButton("Другое значение")],
                 [KeyboardButton("🔙 Назад")]
             ]
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             await update.message.reply_text(
-                "❌ Пожалуйста, выбери одно из предложенных значений.",
+                "❌ Пожалуйста, выбери одно из предложенных значений или 'Другое значение'.",
                 reply_markup=reply_markup
             )
             return EDIT_LIFE_EXPECTANCY
             
         user_id = update.message.from_user.id
         try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute(
-                "UPDATE users SET life_expectancy = %s WHERE user_id = %s",
-                (new_life_expectancy, user_id)
-            )
-            
-            conn.commit()
-            cursor.close()
-            conn.close()
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE users SET life_expectancy = %s WHERE user_id = %s",
+                        (new_life_expectancy, user_id)
+                    )
+                conn.commit()
             
             await update.message.reply_text(
                 f"✅ Ожидаемая продолжительность жизни успешно изменена на {new_life_expectancy} лет!",
@@ -486,14 +558,57 @@ async def edit_life_expectancy(update: Update, context: ContextTypes.DEFAULT_TYP
     except (ValueError, IndexError):
         keyboard = [
             [KeyboardButton("70 лет"), KeyboardButton("80 лет"), KeyboardButton("90 лет")],
+            [KeyboardButton("Другое значение")],
             [KeyboardButton("🔙 Назад")]
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text(
-            "❌ Пожалуйста, выбери одно из предложенных значений.",
+            "❌ Пожалуйста, выбери одно из предложенных значений или 'Другое значение'.",
             reply_markup=reply_markup
         )
         return EDIT_LIFE_EXPECTANCY
+
+async def custom_life_expectancy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает ввод произвольного значения продолжительности жизни"""
+    try:
+        new_life_expectancy = int(update.message.text)
+        
+        # Проверяем, что значение находится в разумном диапазоне
+        if new_life_expectancy < 50 or new_life_expectancy > 120:
+            await update.message.reply_text(
+                "❌ Пожалуйста, введи значение от 50 до 120 лет:"
+            )
+            return CUSTOM_LIFE_EXPECTANCY
+            
+        user_id = update.message.from_user.id
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE users SET life_expectancy = %s WHERE user_id = %s",
+                        (new_life_expectancy, user_id)
+                    )
+                conn.commit()
+            
+            await update.message.reply_text(
+                f"✅ Ожидаемая продолжительность жизни успешно изменена на {new_life_expectancy} лет!",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+            
+        except psycopg2.Error as e:
+            logger.error(f"Ошибка при обновлении продолжительности жизни пользователя {user_id}: {e}")
+            await update.message.reply_text(
+                "❌ Произошла ошибка при обновлении данных. Пожалуйста, попробуйте позже.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Пожалуйста, введи целое число от 50 до 120:"
+        )
+        return CUSTOM_LIFE_EXPECTANCY
 
 def generate_life_calendar(birthdate: date, life_expectancy: int) -> io.BytesIO:
     """Генерирует изображение календаря жизни"""
@@ -574,16 +689,13 @@ async def show_life_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.message.from_user.id
     
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            "SELECT name, birthdate, life_expectancy FROM users WHERE user_id = %s", 
-            (user_id,)
-        )
-        user_data = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT name, birthdate, life_expectancy FROM users WHERE user_id = %s", 
+                    (user_id,)
+                )
+                user_data = cursor.fetchone()
         
         if not user_data:
             await update.message.reply_text(
@@ -618,21 +730,31 @@ async def send_weekly_update(context: ContextTypes.DEFAULT_TYPE):
     today = date.today()
     
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, name, birthdate, life_expectancy FROM users")
-        users = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT user_id, name, birthdate, life_expectancy, notifications_enabled FROM users")
+                users = cursor.fetchall()
     except psycopg2.Error as e:
         logger.error(f"Ошибка при получении данных пользователей: {e}")
         return
 
-    for user_id, name, birthdate, life_expectancy in users:
+    for user_data in users:
+        user_id, name, birthdate, life_expectancy, notifications_enabled = user_data
+        
+        # Пропускаем пользователей, отключивших уведомления
+        if not notifications_enabled:
+            logger.info(f"Пропускаем отправку уведомления пользователю {user_id} ({name}), т.к. уведомления отключены")
+            continue
+            
         try:
+            # Используем dateutil для более точных расчетов
+            delta = relativedelta(today, birthdate)
             weeks = (today - birthdate).days // 7
-            years = (today - birthdate).days // 365
-            remaining_years = life_expectancy - years
+            years = delta.years
+            
+            # Расчет оставшегося времени с учетом високосных лет
+            remaining_delta = relativedelta(years=life_expectancy) - delta
+            remaining_years = remaining_delta.years
             
             # Отправляем текстовое сообщение
             await context.bot.send_message(
@@ -647,8 +769,94 @@ async def send_weekly_update(context: ContextTypes.DEFAULT_TYPE):
                 photo=calendar_image,
                 caption=f"📅 Твой календарь жизни. Каждый красный квадрат - прожитая неделя."
             )
+        except psycopg2.Error as e:
+            logger.error(f"Ошибка базы данных для пользователя {user_id}: {e}")
+        except telegram.error.TelegramError as e:
+            logger.error(f"Ошибка Telegram для пользователя {user_id}: {e}")
+        except IOError as e:
+            logger.error(f"Ошибка ввода/вывода для пользователя {user_id}: {e}")
         except Exception as e:
-            logger.error(f"Ошибка для пользователя {user_id}: {str(e)}")
+            logger.error(f"Непредвиденная ошибка для пользователя {user_id}: {str(e)}")
+
+async def manage_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает включение/отключение уведомлений"""
+    text = update.message.text
+    user_id = update.message.from_user.id
+    
+    if text == "🔙 Назад":
+        return await edit_profile(update, context)
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                # Определяем новое состояние уведомлений
+                new_state = text == "Включить уведомления"
+                
+                cursor.execute(
+                    "UPDATE users SET notifications_enabled = %s WHERE user_id = %s",
+                    (new_state, user_id)
+                )
+            conn.commit()
+        
+        status = "включены" if new_state else "отключены"
+        await update.message.reply_text(
+            f"✅ Уведомления успешно {status}!",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
+        
+    except psycopg2.Error as e:
+        logger.error(f"Ошибка при обновлении статуса уведомлений пользователя {user_id}: {e}")
+        await update.message.reply_text(
+            "❌ Произошла ошибка при обновлении данных. Пожалуйста, попробуйте позже.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
+
+async def delete_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает удаление профиля пользователя"""
+    text = update.message.text
+    user_id = update.message.from_user.id
+    
+    if text == "❌ Нет, отменить":
+        await update.message.reply_text(
+            "Операция отменена.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
+    
+    if text == "✅ Да, удалить профиль":
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+                conn.commit()
+            
+            await update.message.reply_text(
+                "✅ Твой профиль успешно удален. Если захочешь вернуться, просто зарегистрируйся снова.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+            
+        except psycopg2.Error as e:
+            logger.error(f"Ошибка при удалении профиля пользователя {user_id}: {e}")
+            await update.message.reply_text(
+                "❌ Произошла ошибка при удалении профиля. Пожалуйста, попробуйте позже.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+    
+    # Если пользователь ввел что-то другое
+    keyboard = [
+        [KeyboardButton("✅ Да, удалить профиль")],
+        [KeyboardButton("❌ Нет, отменить")]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text(
+        "⚠️ Пожалуйста, выбери один из предложенных вариантов.",
+        reply_markup=reply_markup
+    )
+    return DELETE_PROFILE
 
 def main() -> None:
     # Получаем токен бота из переменной окружения
@@ -669,6 +877,9 @@ def main() -> None:
             EDIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_name)],
             EDIT_BIRTHDATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_birthdate)],
             EDIT_LIFE_EXPECTANCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_life_expectancy)],
+            CUSTOM_LIFE_EXPECTANCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_life_expectancy)],
+            MANAGE_NOTIFICATIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, manage_notifications)],
+            DELETE_PROFILE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_profile)],
         },
         fallbacks=[CommandHandler("cancel", cancel)]
     )
