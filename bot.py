@@ -2,8 +2,7 @@ import logging
 import os
 from datetime import datetime, date, time
 import io
-import psycopg2
-from psycopg2 import sql
+import sqlite3
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
@@ -30,29 +29,22 @@ logger = logging.getLogger(__name__)
 # Константы для ConversationHandler
 MAIN_MENU, GET_NAME, GET_BIRTHDATE, EDIT_PROFILE, EDIT_NAME, EDIT_BIRTHDATE, EDIT_LIFE_EXPECTANCY = range(7)
 
-# Получаем параметры подключения к базе данных из переменных окружения
-DB_HOST = os.environ.get('DB_HOST', 'localhost')
-DB_PORT = os.environ.get('DB_PORT', '5432')
-DB_NAME = os.environ.get('DB_NAME', 'weekly_reminder')
-DB_USER = os.environ.get('DB_USER', 'postgres')
-DB_PASSWORD = os.environ.get('DB_PASSWORD', 'postgres')
+# Путь к базе данных SQLite
+DB_PATH = os.path.join(os.path.dirname(__file__), 'data', 'weekly_reminder.db')
 
 class DatabaseConnection:
-    """Контекстный менеджер для работы с базой данных PostgreSQL"""
+    """Контекстный менеджер для работы с базой данных SQLite"""
     def __init__(self):
         self.conn = None
         
     def __enter__(self):
         try:
-            self.conn = psycopg2.connect(
-                host=DB_HOST,
-                port=DB_PORT,
-                dbname=DB_NAME,
-                user=DB_USER,
-                password=DB_PASSWORD
-            )
+            # Создаем директорию data, если она не существует
+            os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+            self.conn = sqlite3.connect(DB_PATH)
+            self.conn.row_factory = sqlite3.Row  # Для доступа к колонкам по имени
             return self.conn
-        except psycopg2.Error as e:
+        except sqlite3.Error as e:
             logger.error(f"Ошибка при подключении к базе данных: {e}")
             raise
             
@@ -61,69 +53,51 @@ class DatabaseConnection:
             self.conn.close()
             
 def get_db_connection():
-    """Создает и возвращает соединение с базой данных PostgreSQL как контекстный менеджер"""
+    """Создает и возвращает соединение с базой данных SQLite как контекстный менеджер"""
     return DatabaseConnection()
 
 def init_db():
     try:
         with get_db_connection() as conn:
-            conn.autocommit = True
-            with conn.cursor() as cursor:
-                # Проверяем, существует ли таблица users
-                cursor.execute("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_name = 'users'
-                    );
-                """)
-                result = cursor.fetchone()
-                table_exists = result[0] if result is not None else False
-                
-                if not table_exists:
-                    # Создаем таблицу users
-                    cursor.execute("""
-                        CREATE TABLE users (
-                            user_id BIGINT PRIMARY KEY,
-                            name TEXT NOT NULL,
-                            birthdate DATE NOT NULL,
-                            life_expectancy INTEGER DEFAULT 90,
-                            notifications_enabled BOOLEAN DEFAULT TRUE
-                        )
-                    """)
-                    logger.info("Таблица users создана успешно")
-                else:
-                    # Проверяем, существует ли колонка life_expectancy
-                    cursor.execute("""
-                        SELECT EXISTS (
-                            SELECT FROM information_schema.columns 
-                            WHERE table_name = 'users' AND column_name = 'life_expectancy'
-                        );
-                    """)
-                    result = cursor.fetchone()
-                    column_exists = result[0] if result is not None else False
-                    
-                    if not column_exists:
-                        # Добавляем колонку life_expectancy, если она не существует
-                        cursor.execute("ALTER TABLE users ADD COLUMN life_expectancy INTEGER DEFAULT 90")
-                        logger.info("Колонка life_expectancy добавлена в таблицу users")
-                    
-                    # Проверяем, существует ли колонка notifications_enabled
-                    cursor.execute("""
-                        SELECT EXISTS (
-                            SELECT FROM information_schema.columns 
-                            WHERE table_name = 'users' AND column_name = 'notifications_enabled'
-                        );
-                    """)
-                    result = cursor.fetchone()
-                    column_exists = result[0] if result is not None else False
-                    
-                    if not column_exists:
-                        # Добавляем колонку notifications_enabled, если она не существует
-                        cursor.execute("ALTER TABLE users ADD COLUMN notifications_enabled BOOLEAN DEFAULT TRUE")
-                        logger.info("Колонка notifications_enabled добавлена в таблицу users")
+            cursor = conn.cursor()
             
-            logger.info(f"База данных PostgreSQL инициализирована успешно")
-    except psycopg2.Error as e:
+            # Проверяем, существует ли таблица users
+            cursor.execute("""
+                SELECT name FROM sqlite_master 
+                WHERE type='table' AND name='users'
+            """)
+            table_exists = cursor.fetchone() is not None
+            
+            if not table_exists:
+                # Создаем таблицу users
+                cursor.execute("""
+                    CREATE TABLE users (
+                        user_id INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        birthdate TEXT NOT NULL,
+                        life_expectancy INTEGER DEFAULT 90,
+                        notifications_enabled INTEGER DEFAULT 1
+                    )
+                """)
+                logger.info("Таблица users создана успешно")
+            else:
+                # Проверяем, существует ли колонка life_expectancy
+                cursor.execute("PRAGMA table_info(users)")
+                columns = [column[1] for column in cursor.fetchall()]
+                
+                if 'life_expectancy' not in columns:
+                    # Добавляем колонку life_expectancy, если она не существует
+                    cursor.execute("ALTER TABLE users ADD COLUMN life_expectancy INTEGER DEFAULT 90")
+                    logger.info("Колонка life_expectancy добавлена в таблицу users")
+                
+                if 'notifications_enabled' not in columns:
+                    # Добавляем колонку notifications_enabled, если она не существует
+                    cursor.execute("ALTER TABLE users ADD COLUMN notifications_enabled INTEGER DEFAULT 1")
+                    logger.info("Колонка notifications_enabled добавлена в таблицу users")
+            
+            conn.commit()
+            logger.info(f"База данных SQLite инициализирована успешно")
+    except sqlite3.Error as e:
         logger.error(f"Ошибка при инициализации базы данных: {e}")
         raise
 
@@ -199,23 +173,24 @@ async def get_birthdate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         user_id = update.message.from_user.id
         try:
             with get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    # Проверяем, существует ли пользователь
-                    cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
-                    user_exists = cursor.fetchone() is not None
-                    
-                    if user_exists:
-                        # Обновляем существующего пользователя
-                        cursor.execute(
-                            "UPDATE users SET name = %s, birthdate = %s, life_expectancy = %s WHERE user_id = %s",
-                            (context.user_data['name'], birthdate, 90, user_id)
-                        )
-                    else:
-                        # Добавляем нового пользователя
-                        cursor.execute(
-                            "INSERT INTO users (user_id, name, birthdate, life_expectancy, notifications_enabled) VALUES (%s, %s, %s, %s, %s)",
-                            (user_id, context.user_data['name'], birthdate, 90, True)
-                        )
+                cursor = conn.cursor()
+                # Проверяем, существует ли пользователь
+                cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+                user_exists = cursor.fetchone() is not None
+                
+                if user_exists:
+                    # Обновляем существующего пользователя
+                    cursor.execute(
+                        "UPDATE users SET name = ?, birthdate = ?, life_expectancy = ? WHERE user_id = ?",
+                        (context.user_data['name'], birthdate, 90, user_id)
+                    )
+                else:
+                    # Добавляем нового пользователя
+                    cursor.execute(
+                        "INSERT INTO users (user_id, name, birthdate, life_expectancy, notifications_enabled) VALUES (?, ?, ?, ?, ?)",
+                        (user_id, context.user_data['name'], birthdate, 90, True)
+                    )
+                cursor.close()
                 
                 conn.commit()
             
@@ -224,7 +199,7 @@ async def get_birthdate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 reply_markup=get_main_menu_keyboard()
             )
             return MAIN_MENU
-        except psycopg2.Error as e:
+        except sqlite3.Error as e:
             logger.error(f"Ошибка при сохранении данных пользователя {user_id}: {e}")
             await update.message.reply_text(
                 "❌ Произошла ошибка при сохранении данных. Пожалуйста, попробуйте позже.",
@@ -243,12 +218,13 @@ async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     try:
         with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT name, birthdate, life_expectancy FROM users WHERE user_id = %s", 
-                    (user_id,)
-                )
-                user_data = cursor.fetchone()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name, birthdate, life_expectancy FROM users WHERE user_id = ?", 
+                (user_id,)
+            )
+            user_data = cursor.fetchone()
+            cursor.close()
         
         if not user_data:
             await update.message.reply_text(
@@ -257,8 +233,9 @@ async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return MAIN_MENU
             
-        name, birthdate, life_expectancy = user_data
-        # birthdate уже является объектом date в PostgreSQL
+        name, birthdate_str, life_expectancy = user_data
+        # Парсим строку даты из SQLite в объект date
+        birthdate = datetime.strptime(birthdate_str, '%Y-%m-%d').date()
         
         # Расчет статистики с использованием dateutil для точных расчетов
         delta = relativedelta(today, birthdate)
@@ -295,7 +272,7 @@ async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return MAIN_MENU
         
-    except psycopg2.Error as e:
+    except sqlite3.Error as e:
         logger.error(f"Ошибка при получении данных пользователя {user_id}: {e}")
         await update.message.reply_text(
             "❌ Произошла ошибка при получении данных. Пожалуйста, попробуйте позже.",
@@ -309,12 +286,13 @@ async def edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     
     try:
         with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT name, birthdate, life_expectancy, notifications_enabled FROM users WHERE user_id = %s", 
-                    (user_id,)
-                )
-                user_data = cursor.fetchone()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name, birthdate, life_expectancy, notifications_enabled FROM users WHERE user_id = ?", 
+                (user_id,)
+            )
+            user_data = cursor.fetchone()
+            cursor.close()
         
         if not user_data:
             await update.message.reply_text(
@@ -323,8 +301,9 @@ async def edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             )
             return MAIN_MENU
             
-        name, birthdate, life_expectancy, notifications_enabled = user_data
-        # birthdate уже является объектом date в PostgreSQL
+        name, birthdate_str, life_expectancy, notifications_enabled = user_data
+        # Парсим строку даты из SQLite в объект date
+        birthdate = datetime.strptime(birthdate_str, '%Y-%m-%d').date()
         
         notifications_status = "Включены ✅" if notifications_enabled else "Отключены ❌"
         
@@ -348,7 +327,7 @@ async def edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return EDIT_PROFILE
         
-    except psycopg2.Error as e:
+    except sqlite3.Error as e:
         logger.error(f"Ошибка при получении данных пользователя {user_id}: {e}")
         await update.message.reply_text(
             "❌ Произошла ошибка при получении данных. Пожалуйста, попробуйте позже.",
@@ -385,27 +364,28 @@ async def edit_profile_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         user_id = update.message.from_user.id
         try:
             with get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT notifications_enabled FROM users WHERE user_id = %s", 
-                        (user_id,)
-                    )
-                    result = cursor.fetchone()
-                    notifications_enabled = result[0] if result else True
-                    
-                    # Создаем клавиатуру с противоположным действием
-                    keyboard = [[
-                        KeyboardButton("Отключить уведомления" if notifications_enabled else "Включить уведомления")
-                    ], [KeyboardButton("🔙 Назад")]]
-                    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-                    
-                    status = "включены" if notifications_enabled else "отключены"
-                    await update.message.reply_text(
-                        f"Сейчас уведомления {status}. Что ты хочешь сделать?",
-                        reply_markup=reply_markup
-                    )
-                    return MANAGE_NOTIFICATIONS
-        except psycopg2.Error as e:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT notifications_enabled FROM users WHERE user_id = ?", 
+                    (user_id,)
+                )
+                result = cursor.fetchone()
+                notifications_enabled = result[0] if result else True
+                cursor.close()
+                
+                # Создаем клавиатуру с противоположным действием
+                keyboard = [[
+                    KeyboardButton("Отключить уведомления" if notifications_enabled else "Включить уведомления")
+                ], [KeyboardButton("🔙 Назад")]]
+                reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+                
+                status = "включены" if notifications_enabled else "отключены"
+                await update.message.reply_text(
+                    f"Сейчас уведомления {status}. Что ты хочешь сделать?",
+                    reply_markup=reply_markup
+                )
+                return MANAGE_NOTIFICATIONS
+        except sqlite3.Error as e:
             logger.error(f"Ошибка при получении статуса уведомлений пользователя {user_id}: {e}")
             await update.message.reply_text(
                 "❌ Произошла ошибка при получении данных. Пожалуйста, попробуйте позже.",
@@ -442,11 +422,12 @@ async def edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     try:
         with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE users SET name = %s WHERE user_id = %s",
-                    (new_name, user_id)
-                )
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET name = ? WHERE user_id = ?",
+                (new_name, user_id)
+            )
+            cursor.close()
             conn.commit()
         
         await update.message.reply_text(
@@ -455,7 +436,7 @@ async def edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return MAIN_MENU
         
-    except psycopg2.Error as e:
+    except sqlite3.Error as e:
         logger.error(f"Ошибка при обновлении имени пользователя {user_id}: {e}")
         await update.message.reply_text(
             "❌ Произошла ошибка при обновлении данных. Пожалуйста, попробуйте позже.",
@@ -474,11 +455,12 @@ async def edit_birthdate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_id = update.message.from_user.id
         try:
             with get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "UPDATE users SET birthdate = %s WHERE user_id = %s",
-                        (new_birthdate, user_id)
-                    )
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE users SET birthdate = ? WHERE user_id = ?",
+                    (new_birthdate, user_id)
+                )
+                cursor.close()
                 conn.commit()
             
             await update.message.reply_text(
@@ -487,7 +469,7 @@ async def edit_birthdate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return MAIN_MENU
             
-        except psycopg2.Error as e:
+        except sqlite3.Error as e:
             logger.error(f"Ошибка при обновлении даты рождения пользователя {user_id}: {e}")
             await update.message.reply_text(
                 "❌ Произошла ошибка при обновлении данных. Пожалуйста, попробуйте позже.",
@@ -534,11 +516,12 @@ async def edit_life_expectancy(update: Update, context: ContextTypes.DEFAULT_TYP
         user_id = update.message.from_user.id
         try:
             with get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "UPDATE users SET life_expectancy = %s WHERE user_id = %s",
-                        (new_life_expectancy, user_id)
-                    )
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE users SET life_expectancy = ? WHERE user_id = ?",
+                    (new_life_expectancy, user_id)
+                )
+                cursor.close()
                 conn.commit()
             
             await update.message.reply_text(
@@ -547,7 +530,7 @@ async def edit_life_expectancy(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return MAIN_MENU
             
-        except psycopg2.Error as e:
+        except sqlite3.Error as e:
             logger.error(f"Ошибка при обновлении продолжительности жизни пользователя {user_id}: {e}")
             await update.message.reply_text(
                 "❌ Произошла ошибка при обновлении данных. Пожалуйста, попробуйте позже.",
@@ -583,11 +566,12 @@ async def custom_life_expectancy(update: Update, context: ContextTypes.DEFAULT_T
         user_id = update.message.from_user.id
         try:
             with get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "UPDATE users SET life_expectancy = %s WHERE user_id = %s",
-                        (new_life_expectancy, user_id)
-                    )
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE users SET life_expectancy = ? WHERE user_id = ?",
+                    (new_life_expectancy, user_id)
+                )
+                cursor.close()
                 conn.commit()
             
             await update.message.reply_text(
@@ -596,7 +580,7 @@ async def custom_life_expectancy(update: Update, context: ContextTypes.DEFAULT_T
             )
             return MAIN_MENU
             
-        except psycopg2.Error as e:
+        except sqlite3.Error as e:
             logger.error(f"Ошибка при обновлении продолжительности жизни пользователя {user_id}: {e}")
             await update.message.reply_text(
                 "❌ Произошла ошибка при обновлении данных. Пожалуйста, попробуйте позже.",
@@ -690,12 +674,13 @@ async def show_life_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     try:
         with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT name, birthdate, life_expectancy FROM users WHERE user_id = %s", 
-                    (user_id,)
-                )
-                user_data = cursor.fetchone()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name, birthdate, life_expectancy FROM users WHERE user_id = ?", 
+                (user_id,)
+            )
+            user_data = cursor.fetchone()
+            cursor.close()
         
         if not user_data:
             await update.message.reply_text(
@@ -704,8 +689,9 @@ async def show_life_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return MAIN_MENU
             
-        name, birthdate, life_expectancy = user_data
-        # birthdate уже является объектом date в PostgreSQL
+        name, birthdate_str, life_expectancy = user_data
+        # Парсим строку даты из SQLite в объект date
+        birthdate = datetime.strptime(birthdate_str, '%Y-%m-%d').date()
         
         # Генерируем календарь жизни
         calendar_image = generate_life_calendar(birthdate, life_expectancy)
@@ -718,7 +704,7 @@ async def show_life_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return MAIN_MENU
         
-    except psycopg2.Error as e:
+    except sqlite3.Error as e:
         logger.error(f"Ошибка при получении данных пользователя {user_id}: {e}")
         await update.message.reply_text(
             "❌ Произошла ошибка при получении данных. Пожалуйста, попробуйте позже.",
@@ -731,15 +717,16 @@ async def send_weekly_update(context: ContextTypes.DEFAULT_TYPE):
     
     try:
         with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT user_id, name, birthdate, life_expectancy, notifications_enabled FROM users")
-                users = cursor.fetchall()
-    except psycopg2.Error as e:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id, name, birthdate, life_expectancy, notifications_enabled FROM users")
+            users = cursor.fetchall()
+            cursor.close()
+    except sqlite3.Error as e:
         logger.error(f"Ошибка при получении данных пользователей: {e}")
         return
 
     for user_data in users:
-        user_id, name, birthdate, life_expectancy, notifications_enabled = user_data
+        user_id, name, birthdate_str, life_expectancy, notifications_enabled = user_data
         
         # Пропускаем пользователей, отключивших уведомления
         if not notifications_enabled:
@@ -747,6 +734,9 @@ async def send_weekly_update(context: ContextTypes.DEFAULT_TYPE):
             continue
             
         try:
+            # Парсим строку даты из SQLite в объект date
+            birthdate = datetime.strptime(birthdate_str, '%Y-%m-%d').date()
+            
             # Используем dateutil для более точных расчетов
             delta = relativedelta(today, birthdate)
             weeks = (today - birthdate).days // 7
@@ -769,7 +759,7 @@ async def send_weekly_update(context: ContextTypes.DEFAULT_TYPE):
                 photo=calendar_image,
                 caption=f"📅 Твой календарь жизни. Каждый красный квадрат - прожитая неделя."
             )
-        except psycopg2.Error as e:
+        except sqlite3.Error as e:
             logger.error(f"Ошибка базы данных для пользователя {user_id}: {e}")
         except telegram.error.TelegramError as e:
             logger.error(f"Ошибка Telegram для пользователя {user_id}: {e}")
@@ -788,14 +778,15 @@ async def manage_notifications(update: Update, context: ContextTypes.DEFAULT_TYP
     
     try:
         with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                # Определяем новое состояние уведомлений
-                new_state = text == "Включить уведомления"
-                
-                cursor.execute(
-                    "UPDATE users SET notifications_enabled = %s WHERE user_id = %s",
-                    (new_state, user_id)
-                )
+            cursor = conn.cursor()
+            # Определяем новое состояние уведомлений
+            new_state = text == "Включить уведомления"
+            
+            cursor.execute(
+                "UPDATE users SET notifications_enabled = ? WHERE user_id = ?",
+                (new_state, user_id)
+            )
+            cursor.close()
             conn.commit()
         
         status = "включены" if new_state else "отключены"
@@ -805,7 +796,7 @@ async def manage_notifications(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return MAIN_MENU
         
-    except psycopg2.Error as e:
+    except sqlite3.Error as e:
         logger.error(f"Ошибка при обновлении статуса уведомлений пользователя {user_id}: {e}")
         await update.message.reply_text(
             "❌ Произошла ошибка при обновлении данных. Пожалуйста, попробуйте позже.",
@@ -828,8 +819,9 @@ async def delete_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if text == "✅ Да, удалить профиль":
         try:
             with get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+                cursor.close()
                 conn.commit()
             
             await update.message.reply_text(
@@ -838,7 +830,7 @@ async def delete_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return MAIN_MENU
             
-        except psycopg2.Error as e:
+        except sqlite3.Error as e:
             logger.error(f"Ошибка при удалении профиля пользователя {user_id}: {e}")
             await update.message.reply_text(
                 "❌ Произошла ошибка при удалении профиля. Пожалуйста, попробуйте позже.",
