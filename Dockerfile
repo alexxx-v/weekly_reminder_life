@@ -15,7 +15,7 @@ COPY bot.py .
 RUN mkdir -p /app/data
 
 # Указываем, что база данных должна храниться в директории с данными
-ENV DB_PATH=/app/data/bot_users.db
+ENV DB_PATH=/app/data/weekly_reminder.db
 
 # Переменная для токена бота (будет переопределена в docker-compose.yml)
 ENV BOT_TOKEN=""
